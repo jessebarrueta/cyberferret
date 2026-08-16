@@ -1,12 +1,25 @@
+import threading
+import time
+
 import board
 import busio
 from adafruit_pca9685 import PCA9685
+from adafruit_motor import servo
 
 
 class CyberFerretDrive:
-    # Empirically calibrated on Cyber Ferret.
-    STEERING_CENTER_DEG = 99.0
-    STEERING_RANGE_DEG = 25.0
+    PCA_ADDRESS = 0x40
+    PWM_FREQUENCY = 50
+
+    THROTTLE_CHANNEL = 0
+    STEERING_CHANNEL = 1
+
+    STEERING_MIN_DEG = 78
+    STEERING_CENTER_DEG = 99
+    STEERING_MAX_DEG = 132
+
+    STEERING_LEFT_DEG = 132
+    STEERING_RIGHT_DEG = 78
 
     ESC_NEUTRAL_US = 1535
     ESC_FORWARD_START_US = 1631
@@ -14,80 +27,198 @@ class CyberFerretDrive:
     ESC_REVERSE_START_US = 1518
     ESC_REVERSE_MAX_US = 1500
 
-    STEERING_CHANNEL = 0
-    THROTTLE_CHANNEL = 1
+    WATCHDOG_TIMEOUT_S = 0.75
+    WATCHDOG_INTERVAL_S = 0.10
 
     def __init__(self):
-        i2c = busio.I2C(board.SCL, board.SDA)
-        self.pca = PCA9685(i2c)
-        self.pca.frequency = 50
+        self.i2c = busio.I2C(board.SCL, board.SDA)
 
+        self.pca = PCA9685(
+            self.i2c,
+            address=self.PCA_ADDRESS,
+        )
+        self.pca.frequency = self.PWM_FREQUENCY
+
+        self.steering_servo = servo.Servo(
+            self.pca.channels[self.STEERING_CHANNEL],
+            min_pulse=500,
+            max_pulse=2500,
+            actuation_range=180,
+        )
+
+        self.throttle_channel = self.pca.channels[
+            self.THROTTLE_CHANNEL
+        ]
+
+        self._steering = 0.0
+        self._throttle = 0.0
         self._steering_deg = self.STEERING_CENTER_DEG
         self._throttle_us = self.ESC_NEUTRAL_US
 
-        self.center()
+        self._last_command_time = time.monotonic()
+        self._shutdown = False
+
         self.stop()
+        self.steer(0.0)
 
-    @staticmethod
-    def _pulse_us_to_duty_cycle(pulse_us, frequency_hz=50):
-        period_us = 1_000_000.0 / frequency_hz
-        return int((pulse_us / period_us) * 0xFFFF)
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+        )
+        self._watchdog_thread.start()
 
-    @staticmethod
-    def _servo_deg_to_pulse_us(degrees):
-        # Conventional 0–180° servo mapping.
-        degrees = max(0.0, min(180.0, float(degrees)))
-        return 500.0 + (degrees / 180.0) * 2000.0
+    def _pulse_us_to_duty(self, pulse_us):
+        period_us = 1_000_000 / self.PWM_FREQUENCY
+        duty = int((pulse_us / period_us) * 65535)
+        return max(0, min(65535, duty))
 
-    def _write_pulse(self, channel, pulse_us):
-        self.pca.channels[channel].duty_cycle = self._pulse_us_to_duty_cycle(
-            pulse_us,
-            self.pca.frequency,
+    def _set_throttle_us(self, pulse_us):
+        pulse_us = int(pulse_us)
+        pulse_us = max(
+            self.ESC_REVERSE_MAX_US,
+            min(self.ESC_FORWARD_MAX_US, pulse_us),
         )
 
-    def steer(self, value):
-        value = max(-1.0, min(1.0, float(value)))
-        degrees = self.STEERING_CENTER_DEG + value * self.STEERING_RANGE_DEG
-        self._steering_deg = degrees
-        self._write_pulse(
-            self.STEERING_CHANNEL,
-            self._servo_deg_to_pulse_us(degrees),
+        self.throttle_channel.duty_cycle = (
+            self._pulse_us_to_duty(pulse_us)
         )
+        self._throttle_us = pulse_us
+
+    def _touch_watchdog(self):
+        self._last_command_time = time.monotonic()
+
+    def steer(self, amount):
+        """
+        -1.0 = full physical left
+         0.0 = straight
+        +1.0 = full physical right
+        """
+
+        amount = max(-1.0, min(1.0, float(amount)))
+
+        if amount < 0:
+            magnitude = -amount
+            angle = (
+                self.STEERING_CENTER_DEG
+                + (
+                    self.STEERING_LEFT_DEG
+                    - self.STEERING_CENTER_DEG
+                )
+                * magnitude
+            )
+        else:
+            magnitude = amount
+            angle = (
+                self.STEERING_CENTER_DEG
+                + (
+                    self.STEERING_RIGHT_DEG
+                    - self.STEERING_CENTER_DEG
+                )
+                * magnitude
+            )
+
+        angle = max(
+            self.STEERING_MIN_DEG,
+            min(self.STEERING_MAX_DEG, angle),
+        )
+
+        self.steering_servo.angle = angle
+
+        self._steering = amount
+        self._steering_deg = angle
+        self._touch_watchdog()
 
     def center(self):
         self.steer(0.0)
 
-    def throttle(self, value):
-        value = max(-1.0, min(1.0, float(value)))
+    def throttle(self, amount):
+        """
+        -1.0 = maximum allowed reverse
+         0.0 = neutral
+        +1.0 = maximum allowed forward
+        """
 
-        if abs(value) < 0.001:
+        amount = max(-1.0, min(1.0, float(amount)))
+
+        if abs(amount) < 0.0001:
             pulse = self.ESC_NEUTRAL_US
-        elif value > 0:
-            pulse = self.ESC_FORWARD_START_US + value * (
-                self.ESC_FORWARD_MAX_US - self.ESC_FORWARD_START_US
-            )
-        else:
-            magnitude = abs(value)
-            pulse = self.ESC_REVERSE_START_US + magnitude * (
-                self.ESC_REVERSE_MAX_US - self.ESC_REVERSE_START_US
+            amount = 0.0
+
+        elif amount > 0:
+            pulse = (
+                self.ESC_FORWARD_START_US
+                + (
+                    self.ESC_FORWARD_MAX_US
+                    - self.ESC_FORWARD_START_US
+                )
+                * amount
             )
 
-        self._throttle_us = int(round(pulse))
-        self._write_pulse(self.THROTTLE_CHANNEL, self._throttle_us)
+        else:
+            magnitude = -amount
+            pulse = (
+                self.ESC_REVERSE_START_US
+                - (
+                    self.ESC_REVERSE_START_US
+                    - self.ESC_REVERSE_MAX_US
+                )
+                * magnitude
+            )
+
+        self._set_throttle_us(pulse)
+        self._throttle = amount
+        self._touch_watchdog()
+
+    def forward(self, speed):
+        self.throttle(abs(float(speed)))
+
+    def reverse(self, speed):
+        self.throttle(-abs(float(speed)))
 
     def stop(self):
-        self._throttle_us = self.ESC_NEUTRAL_US
-        self._write_pulse(self.THROTTLE_CHANNEL, self._throttle_us)
+        self._set_throttle_us(self.ESC_NEUTRAL_US)
+        self._throttle = 0.0
+        self._touch_watchdog()
+
+    def adjust_throttle(self, delta):
+        self.throttle(self._throttle + delta)
+
+    def adjust_steering(self, delta):
+        self.steer(self._steering + delta)
+
+    def _watchdog_loop(self):
+        while not self._shutdown:
+            elapsed = (
+                time.monotonic()
+                - self._last_command_time
+            )
+
+            if (
+                elapsed > self.WATCHDOG_TIMEOUT_S
+                and self._throttle != 0.0
+            ):
+                self._set_throttle_us(
+                    self.ESC_NEUTRAL_US
+                )
+                self._throttle = 0.0
+
+            time.sleep(self.WATCHDOG_INTERVAL_S)
 
     def status(self):
         return {
+            "steering": round(self._steering, 3),
+            "steering_deg": round(self._steering_deg, 1),
+            "throttle": round(self._throttle, 3),
             "throttle_us": self._throttle_us,
-            "steering_deg": self._steering_deg,
         }
 
     def shutdown(self):
-        try:
-            self.stop()
-            self.center()
-        finally:
-            self.pca.deinit()
+        self._shutdown = True
+
+        self.stop()
+        self.center()
+
+        time.sleep(0.25)
+
+        self.throttle_channel.duty_cycle = 0
+        self.pca.deinit()
