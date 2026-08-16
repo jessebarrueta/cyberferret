@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pillow
+opencv-contrib-python-headless
+adafruit-blinka
+adafruit-circuitpython-pca9685
