@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -13,7 +14,7 @@ import cyberferret_safety as safety
 from cyberferret_control import approach
 from cyberferret_events import EventDetector
 from cyberferret_follow import FollowController
-from cyberferret_recorder import ExperienceRecorder
+from cyberferret_recorder import DEFAULT_ROOT, ExperienceRecorder
 from cyberferret_state import FerretState
 from cyberferret_vision import ArucoVision
 
@@ -61,10 +62,26 @@ events = EventDetector(
     target_reached_size=follow.target_size,
 )
 
+# Simulated experience is not experience. In sim mode, recording is off
+# unless explicitly requested, and even then it goes to a separate root so
+# synthetic frames can never mingle with the real vehicle's history.
+RECORD_ENABLED = (
+    not SIM_MODE
+    or os.environ.get("CYBERFERRET_RECORD") == "1"
+)
+
+RECORD_ROOT = (
+    str(Path(DEFAULT_ROOT).parent / "sim-sessions")
+    if SIM_MODE
+    else DEFAULT_ROOT
+)
+
 recorder = ExperienceRecorder(
     camera=camera,
     state=state,
+    state_lock=state_lock,
     interval_s=0.25,
+    root=RECORD_ROOT,
 )
 
 
@@ -415,7 +432,15 @@ async def lifespan(app: FastAPI):
     print("Cyber Ferret waking up...")
 
     camera.start()
-    recorder.start()
+
+    if RECORD_ENABLED:
+        recorder.start()
+    else:
+        print(
+            "Recording disabled in sim mode "
+            "(set CYBERFERRET_RECORD=1 to record sim sessions)"
+        )
+
     start_threads()
 
     try:

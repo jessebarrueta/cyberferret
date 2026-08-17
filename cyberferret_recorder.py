@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -16,11 +17,20 @@ class ExperienceRecorder:
         self,
         camera,
         state,
+        state_lock=None,
         interval_s=0.25,
         root=DEFAULT_ROOT,
     ):
         self.camera = camera
         self.state = state
+
+        # The lock guarding writes to `state`. Snapshotting without it can
+        # capture torn state -- e.g. an emergency stop with reason CLEAR --
+        # and a causal trace that can lie is worse than none.
+        self._state_lock = (
+            state_lock if state_lock is not None else nullcontext()
+        )
+
         self.interval_s = interval_s
         self.root = Path(root)
 
@@ -74,12 +84,15 @@ class ExperienceRecorder:
         if frame is None:
             return
 
+        # Snapshot under the lock; do the slow file I/O outside it.
+        with self._state_lock:
+            snapshot = self.state.to_dict(include_recent_events=False)
+
         self._sequence += 1
         frame_name = f"{self._sequence:06d}.jpg"
         frame_path = self._frames_dir / frame_name
         frame_path.write_bytes(frame["jpeg"])
 
-        snapshot = self.state.to_dict(include_recent_events=False)
         record = {
             "sequence": self._sequence,
             "session_time_s": round(
