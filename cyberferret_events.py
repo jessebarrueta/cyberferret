@@ -1,6 +1,17 @@
 import time
 from collections import deque
 
+import cyberferret_safety as safety
+
+
+SAFETY_REASON_EVENTS = {
+    safety.REASON_EMERGENCY: "EMERGENCY_STOP",
+    safety.REASON_OBSTACLE: "OBSTACLE_STOP",
+    safety.REASON_LINK_LOST: "CONTROL_LINK_LOST",
+    safety.REASON_AUTONOMY_EXPIRED: "AUTONOMY_EXPIRED",
+    safety.REASON_CLEAR: "SAFETY_CLEAR",
+}
+
 
 class EventDetector:
     def __init__(self, max_events=100, target_reached_size=0.23):
@@ -9,7 +20,7 @@ class EventDetector:
         self._last = {
             "mode": None,
             "target_visible": False,
-            "target_size": None,
+            "follow_size": None,
             "safety_reason": None,
             "control_link_ok": False,
         }
@@ -34,6 +45,11 @@ class EventDetector:
         target_visible = state.observation.visual_target_visible
         target_x = state.observation.visual_target_x
         target_size = state.observation.visual_target_size
+
+        # The behavior acted on its filtered estimate, not the raw
+        # measurement, so events about the approach must agree with it.
+        follow_size = state.behavior.follow_filtered_size
+
         throttle = state.intent.throttle
         steering = state.intent.steering
         safety_reason = state.safety.reason
@@ -72,12 +88,12 @@ class EventDetector:
             emitted.append(self._emit(
                 "APPROACH_STARTED",
                 throttle=throttle,
-                target_size=target_size,
+                target_size=follow_size,
             ))
         elif not currently_approaching and self._approaching:
             emitted.append(self._emit(
                 "APPROACH_STOPPED",
-                target_size=target_size,
+                target_size=follow_size,
             ))
 
         self._approaching = currently_approaching
@@ -86,14 +102,14 @@ class EventDetector:
             mode == "FOLLOW"
             and target_visible
             and abs(throttle) < 0.001
-            and target_size is not None
-            and target_size >= self.target_reached_size
+            and follow_size is not None
+            and follow_size >= self.target_reached_size
         ):
-            last_size = self._last["target_size"]
+            last_size = self._last["follow_size"]
             if last_size is None or last_size < self.target_reached_size:
                 emitted.append(self._emit(
                     "TARGET_REACHED",
-                    target_size=target_size,
+                    target_size=follow_size,
                 ))
 
         turn_direction = None
@@ -121,17 +137,17 @@ class EventDetector:
             emitted.append(self._emit("CONTROL_LOST"))
 
         if safety_reason != self._last["safety_reason"]:
-            if safety_reason == "EMERGENCY STOP":
-                emitted.append(self._emit("EMERGENCY_STOP"))
-            elif safety_reason == "OBSTACLE":
-                emitted.append(self._emit("OBSTACLE_STOP"))
-            elif safety_reason == "CLEAR":
-                emitted.append(self._emit("SAFETY_CLEAR"))
+            event_type = SAFETY_REASON_EVENTS.get(safety_reason)
+            if event_type is not None:
+                emitted.append(self._emit(
+                    event_type,
+                    mode=mode,
+                ))
 
         self._last = {
             "mode": mode,
             "target_visible": target_visible,
-            "target_size": target_size,
+            "follow_size": follow_size,
             "safety_reason": safety_reason,
             "control_link_ok": control_link_ok,
         }

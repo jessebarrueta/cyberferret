@@ -6,27 +6,24 @@ import busio
 from adafruit_pca9685 import PCA9685
 from adafruit_motor import servo
 
+import cyberferret_calibration as calibration
+
 
 class CyberFerretDrive:
+    """The only thing in Cyber Ferret that talks to actuators.
+
+    The signal mapping itself lives in `cyberferret_calibration`, so what
+    remains here is I2C, the PCA9685, and an independent hardware watchdog.
+    """
+
     PCA_ADDRESS = 0x40
-    PWM_FREQUENCY = 50
 
     THROTTLE_CHANNEL = 0
     STEERING_CHANNEL = 1
 
-    STEERING_MIN_DEG = 78
-    STEERING_CENTER_DEG = 99
-    STEERING_MAX_DEG = 132
-
-    STEERING_LEFT_DEG = 132
-    STEERING_RIGHT_DEG = 78
-
-    ESC_NEUTRAL_US = 1535
-    ESC_FORWARD_START_US = 1631
-    ESC_FORWARD_MAX_US = 1665
-    ESC_REVERSE_START_US = 1518
-    ESC_REVERSE_MAX_US = 1500
-
+    # Independent of anything in the application. If the drive layer stops
+    # receiving commands at all -- because the control loop died, or the whole
+    # event loop stalled -- propulsion returns to neutral without asking.
     WATCHDOG_TIMEOUT_S = 0.75
     WATCHDOG_INTERVAL_S = 0.10
 
@@ -37,13 +34,13 @@ class CyberFerretDrive:
             self.i2c,
             address=self.PCA_ADDRESS,
         )
-        self.pca.frequency = self.PWM_FREQUENCY
+        self.pca.frequency = calibration.PWM_FREQUENCY_HZ
 
         self.steering_servo = servo.Servo(
             self.pca.channels[self.STEERING_CHANNEL],
-            min_pulse=500,
-            max_pulse=2500,
-            actuation_range=180,
+            min_pulse=calibration.SERVO_MIN_PULSE_US,
+            max_pulse=calibration.SERVO_MAX_PULSE_US,
+            actuation_range=calibration.SERVO_ACTUATION_RANGE_DEG,
         )
 
         self.throttle_channel = self.pca.channels[
@@ -52,36 +49,44 @@ class CyberFerretDrive:
 
         self._steering = 0.0
         self._throttle = 0.0
-        self._steering_deg = self.STEERING_CENTER_DEG
-        self._throttle_us = self.ESC_NEUTRAL_US
+        self._steering_deg = calibration.STEERING_CENTER_DEG
+        self._throttle_us = calibration.ESC_NEUTRAL_US
+
+        # Written by the control thread, read by the watchdog thread.
+        self._written_steering_deg = None
+        self._written_throttle_us = None
 
         self._last_command_time = time.monotonic()
         self._shutdown = False
+        self._hardware_lock = threading.Lock()
 
         self.stop()
         self.steer(0.0)
 
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
+            name="drive-watchdog",
             daemon=True,
         )
         self._watchdog_thread.start()
 
-    def _pulse_us_to_duty(self, pulse_us):
-        period_us = 1_000_000 / self.PWM_FREQUENCY
-        duty = int((pulse_us / period_us) * 65535)
-        return max(0, min(65535, duty))
-
     def _set_throttle_us(self, pulse_us):
-        pulse_us = int(pulse_us)
-        pulse_us = max(
-            self.ESC_REVERSE_MAX_US,
-            min(self.ESC_FORWARD_MAX_US, pulse_us),
+        pulse_us = int(
+            max(
+                calibration.ESC_REVERSE_MAX_US,
+                min(calibration.ESC_FORWARD_MAX_US, int(pulse_us)),
+            )
         )
 
-        self.throttle_channel.duty_cycle = (
-            self._pulse_us_to_duty(pulse_us)
-        )
+        with self._hardware_lock:
+            # The PCA9685 holds its own registers, so rewriting an unchanged
+            # value only costs I2C time on a bus the 50 Hz loop is sharing.
+            if pulse_us != self._written_throttle_us:
+                self.throttle_channel.duty_cycle = (
+                    calibration.pulse_us_to_duty(pulse_us)
+                )
+                self._written_throttle_us = pulse_us
+
         self._throttle_us = pulse_us
 
     def _touch_watchdog(self):
@@ -95,34 +100,13 @@ class CyberFerretDrive:
         """
 
         amount = max(-1.0, min(1.0, float(amount)))
+        angle = calibration.steering_to_degrees(amount)
+        rounded = round(angle, 2)
 
-        if amount < 0:
-            magnitude = -amount
-            angle = (
-                self.STEERING_CENTER_DEG
-                + (
-                    self.STEERING_LEFT_DEG
-                    - self.STEERING_CENTER_DEG
-                )
-                * magnitude
-            )
-        else:
-            magnitude = amount
-            angle = (
-                self.STEERING_CENTER_DEG
-                + (
-                    self.STEERING_RIGHT_DEG
-                    - self.STEERING_CENTER_DEG
-                )
-                * magnitude
-            )
-
-        angle = max(
-            self.STEERING_MIN_DEG,
-            min(self.STEERING_MAX_DEG, angle),
-        )
-
-        self.steering_servo.angle = angle
+        with self._hardware_lock:
+            if rounded != self._written_steering_deg:
+                self.steering_servo.angle = angle
+                self._written_steering_deg = rounded
 
         self._steering = amount
         self._steering_deg = angle
@@ -138,34 +122,12 @@ class CyberFerretDrive:
         +1.0 = maximum allowed forward
         """
 
-        amount = max(-1.0, min(1.0, float(amount)))
+        amount = calibration.normalize_throttle(amount)
 
-        if abs(amount) < 0.0001:
-            pulse = self.ESC_NEUTRAL_US
-            amount = 0.0
+        self._set_throttle_us(
+            calibration.throttle_to_pulse_us(amount)
+        )
 
-        elif amount > 0:
-            pulse = (
-                self.ESC_FORWARD_START_US
-                + (
-                    self.ESC_FORWARD_MAX_US
-                    - self.ESC_FORWARD_START_US
-                )
-                * amount
-            )
-
-        else:
-            magnitude = -amount
-            pulse = (
-                self.ESC_REVERSE_START_US
-                - (
-                    self.ESC_REVERSE_START_US
-                    - self.ESC_REVERSE_MAX_US
-                )
-                * magnitude
-            )
-
-        self._set_throttle_us(pulse)
         self._throttle = amount
         self._touch_watchdog()
 
@@ -176,7 +138,7 @@ class CyberFerretDrive:
         self.throttle(-abs(float(speed)))
 
     def stop(self):
-        self._set_throttle_us(self.ESC_NEUTRAL_US)
+        self._set_throttle_us(calibration.ESC_NEUTRAL_US)
         self._throttle = 0.0
         self._touch_watchdog()
 
@@ -197,8 +159,12 @@ class CyberFerretDrive:
                 elapsed > self.WATCHDOG_TIMEOUT_S
                 and self._throttle != 0.0
             ):
+                print(
+                    "[DRIVE] watchdog: no commands for "
+                    f"{elapsed:.2f}s, forcing neutral"
+                )
                 self._set_throttle_us(
-                    self.ESC_NEUTRAL_US
+                    calibration.ESC_NEUTRAL_US
                 )
                 self._throttle = 0.0
 
@@ -220,5 +186,11 @@ class CyberFerretDrive:
 
         time.sleep(0.25)
 
-        self.throttle_channel.duty_cycle = 0
-        self.pca.deinit()
+        # Join before deinit, so the watchdog cannot write to a released bus.
+        self._watchdog_thread.join(
+            timeout=self.WATCHDOG_INTERVAL_S * 5
+        )
+
+        with self._hardware_lock:
+            self.throttle_channel.duty_cycle = 0
+            self.pca.deinit()

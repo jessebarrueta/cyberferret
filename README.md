@@ -7,14 +7,20 @@ Cyber Ferret uses a layered architecture so perception and higher-level reasonin
 ## Current capabilities
 
 - Browser HUD and WASD manual control
-- 50 Hz control loop
+- 50 Hz control loop in a dedicated thread
 - Camera MJPEG stream
 - ArUco marker perception
 - Autonomous marker-follow mode
 - Safe stop when the visual target is lost
+- Latched emergency stop with explicit clear
+- Deterministic safety arbitration with a link watchdog in every mode
+- Autonomy time limit for unattended runs
+- Single-controller browser ownership
 - Session recording with frames and JSONL observations
 - Semantic event detection
 - Hardware drive watchdog
+- Simulated body for laptop development
+- Hardware-free unit tests for calibration, safety, and behavior
 - Git-based development workflow
 
 ## Connect
@@ -34,6 +40,32 @@ uvicorn cyberferret_web:app --host 0.0.0.0 --port 8000
 ```
 
 Then open Cyber Ferret's port `8000` in a browser.
+
+## Run on a laptop (no hardware)
+
+The whole stack — real vision, real behavior, real safety arbitration — can run
+against a simulated body:
+
+```bash
+pip install fastapi 'uvicorn[standard]' pillow opencv-contrib-python-headless numpy
+CYBERFERRET_SIM=1 uvicorn cyberferret_web:app --port 8000
+```
+
+The simulated world contains marker 7 ahead and slightly to the left; FOLLOW
+mode will turn toward it and approach.
+
+## Tests
+
+The calibration mappings, safety arbitration, follow behavior, and event
+detection are pure modules tested without hardware:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The simulation tests (skipped unless opencv is installed) additionally verify
+the closed loop: real ArUco detection over rendered frames drives the real
+follow controller toward the marker.
 
 ## Stop the server
 
@@ -130,7 +162,21 @@ These are physical calibration values for this vehicle, not generic constants.
 
 Test new motion or autonomous behavior with the drive wheels elevated first.
 
-`SPACE` is the emergency stop in MANUAL and FOLLOW modes. A lower-level drive watchdog also returns propulsion to neutral if the drive layer stops receiving commands.
+`SPACE` is the emergency stop in MANUAL and FOLLOW modes. It **latches**: motion
+stays stopped until the CLEAR E-STOP button is pressed, and autonomy must be
+re-armed by a human afterwards.
+
+Safety arbitration applies in every mode, in precedence order: emergency stop,
+obstacle (reserved for the ToF sensors), control link lost, autonomy time
+limit. In MANUAL the link watchdog stops the vehicle after 0.5 s of browser
+silence; in FOLLOW a 3 s tolerance rides out Wi-Fi hiccups, but a real
+disconnect stops the vehicle and disarms autonomy — a rover that cannot be
+told to stop does not get to keep driving. A single autonomous run is also
+capped at 5 minutes.
+
+Below all of that, a lower-level drive watchdog independently returns
+propulsion to neutral if the drive layer stops receiving commands — including
+if the control thread itself dies.
 
 ## Documentation
 

@@ -30,6 +30,8 @@ class BodyState:
 
 @dataclass
 class ObservationState:
+    """What Cyber Ferret believes it senses, before any behavior filtering."""
+
     sequence: int = 0
     captured_at: float = 0.0
     captured_at_epoch: float = 0.0
@@ -40,6 +42,20 @@ class ObservationState:
     visual_target_x: float | None = None
     visual_target_y: float | None = None
     visual_target_size: float | None = None
+
+
+@dataclass
+class BehaviorState:
+    """What the active behavior currently believes.
+
+    Kept separate from ObservationState: the raw measurement and the filtered
+    quantity a controller actually acted on are different facts, and a causal
+    trace needs both.
+    """
+
+    follow_acquired: bool = False
+    follow_filtered_x: float | None = None
+    follow_filtered_size: float | None = None
 
 
 @dataclass
@@ -60,17 +76,30 @@ class EnvironmentState:
 @dataclass
 class SafetyState:
     control_link_ok: bool = False
+
+    # Latched: stays set until a human explicitly clears it.
     emergency_stop: bool = False
+
     obstacle_stop: bool = False
-    watchdog_stop: bool = False
+
+    # The commanding browser stopped talking to us.
+    link_stop: bool = True
+
+    # A single autonomous run exceeded its permitted duration.
+    autonomy_expired: bool = False
+
     reason: str = "WAITING FOR CONTROL"
+
+    autonomy_age_s: float | None = None
+    autonomy_limit_s: float | None = None
 
     @property
     def clear(self):
         return not (
             self.emergency_stop
             or self.obstacle_stop
-            or self.watchdog_stop
+            or self.link_stop
+            or self.autonomy_expired
         )
 
 
@@ -87,6 +116,7 @@ class FerretState:
     intent: ControlIntent = field(default_factory=ControlIntent)
     body: BodyState = field(default_factory=BodyState)
     observation: ObservationState = field(default_factory=ObservationState)
+    behavior: BehaviorState = field(default_factory=BehaviorState)
     environment: EnvironmentState = field(default_factory=EnvironmentState)
     safety: SafetyState = field(default_factory=SafetyState)
     events: EventState = field(default_factory=EventState)
@@ -96,8 +126,14 @@ class FerretState:
     vision_hz: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
-    def to_dict(self):
+    def to_dict(self, include_recent_events=True):
         data = asdict(self)
         data["uptime_s"] = round(time.monotonic() - self.started_at, 1)
         data["safety"]["clear"] = self.safety.clear
+
+        if not include_recent_events:
+            # The event ring is HUD convenience. Writing it into every
+            # recorded frame would store each event about twenty times over.
+            data["events"].pop("recent", None)
+
         return data
