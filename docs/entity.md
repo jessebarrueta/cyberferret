@@ -57,18 +57,42 @@ The entity currently scores:
 
 The result is a **recommendation**, not a command.
 
-A future integration step can decide whether entity recommendations are allowed to select an existing behavior controller. The current safety and control architecture remains unchanged.
+## Runtime integration
+
+The entity now runs as a slow advisory loop alongside control, vision, and event
+processing.
+
+New semantic events are fed into `CyberFerretEntity.consume_events()`. The
+entity ticks at 4 Hz, evaluates the current observation and safety state, and
+publishes its drives plus behavior recommendation into `FerretState`.
+
+That state flows through the existing recorder and websocket/HUD paths, so the
+entity's changing internal state becomes both observable and recordable.
+
+It remains **advisory only**. There is intentionally no connection from an
+entity recommendation to `ControlHub`, the drive layer, or safety arbitration.
+
+This gives us live internal state before granting the entity any
+behavior-selection authority.
 
 ## Why this starts hardware-free
 
-The entity consumes abstractions, not GPIO/I2C values. This lets us test personality dynamics and decision policy in simulation while physical sensors are still being added.
+The entity consumes abstractions, not GPIO/I2C values. This lets us test
+personality dynamics and decision policy in simulation while physical sensors
+are still being added.
 
-Incoming ToF/IMU/steering/speed data will enrich `ObservationState`; the entity contract should not need to change merely because Cyber Ferret gains another sense.
+Incoming ToF/IMU/steering/speed data will enrich `ObservationState`; the entity
+contract should not need to change merely because Cyber Ferret gains another
+sense.
 
 ## Next integration step
 
-Feed newly emitted semantic events into `CyberFerretEntity.consume_events()` from the existing event thread, tick the entity at a slow rate (around 2–5 Hz), and expose its snapshot in `FerretState` / the HUD.
+Observe the entity in simulation and on the physical ferret. Verify that its
+drive changes and recommendations remain sensible across target acquisition,
+target loss, safety events, and periods of inactivity.
 
-Initially the entity should remain **advisory only**.
+Once those transitions are useful rather than merely entertaining, add an
+explicit `ENTITY` mode in which recommendations may select deterministic
+behaviors such as FOLLOW or a future INVESTIGATE behavior.
 
-Once its state transitions and recommendations are observable and sane, add an explicit ENTITY mode in which recommendations may select deterministic behaviors such as FOLLOW or future INVESTIGATE.
+The entity should still never emit actuator commands directly.

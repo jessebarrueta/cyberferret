@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 import cyberferret_safety as safety
 from cyberferret_control import approach
+from cyberferret_entity import CyberFerretEntity
 from cyberferret_events import EventDetector
 from cyberferret_follow import FollowController
 from cyberferret_recorder import DEFAULT_ROOT, ExperienceRecorder
@@ -29,6 +30,7 @@ STEERING_RAMP_PER_SEC = 2.5
 
 VISION_HZ = 8
 EVENT_HZ = 20
+ENTITY_HZ = 4
 
 
 SIM_MODE = os.environ.get("CYBERFERRET_SIM") == "1"
@@ -61,6 +63,10 @@ events = EventDetector(
     max_events=100,
     target_reached_size=follow.target_size,
 )
+
+entity = CyberFerretEntity()
+entity_lock = threading.Lock()
+
 
 # Simulated experience is not experience. In sim mode, recording is off
 # unless explicitly requested, and even then it goes to a separate root so
@@ -277,12 +283,7 @@ def control_cycle(desired_throttle, desired_steering):
 
 
 def control_thread_main():
-    """The 50 Hz loop, in its own thread.
-
-    Deliberately not a coroutine: it must not share a scheduler with HTTP
-    handlers and video streaming. If this thread dies, the drive layer's
-    independent hardware watchdog returns propulsion to neutral.
-    """
+    """The 50 Hz loop, in its own thread."""
 
     desired_throttle = 0.0
     desired_steering = 0.0
@@ -349,23 +350,15 @@ def vision_thread_main():
             if result is not None:
                 with state_lock:
                     state.observation.sequence = frame["sequence"]
-                    state.observation.captured_at = (
-                        frame["monotonic_timestamp"]
-                    )
-                    state.observation.captured_at_epoch = (
-                        frame["timestamp"]
-                    )
+                    state.observation.captured_at = frame["monotonic_timestamp"]
+                    state.observation.captured_at_epoch = frame["timestamp"]
                     state.observation.width = frame["width"]
                     state.observation.height = frame["height"]
-                    state.observation.visual_target_visible = (
-                        result["visible"]
-                    )
+                    state.observation.visual_target_visible = result["visible"]
                     state.observation.visual_target_id = result["id"]
                     state.observation.visual_target_x = result["x"]
                     state.observation.visual_target_y = result["y"]
-                    state.observation.visual_target_size = (
-                        result["size"]
-                    )
+                    state.observation.visual_target_size = result["size"]
 
                 vision_counter += 1
 
@@ -386,6 +379,8 @@ def event_thread_main():
     interval = 1.0 / EVENT_HZ
 
     while not _stop_threads.is_set():
+        emitted = []
+
         with state_lock:
             emitted = events.update(state)
 
@@ -395,7 +390,64 @@ def event_thread_main():
                 state.events.last_timestamp = emitted[-1]["timestamp"]
                 state.events.recent = events.recent(20)
 
+        # Never take entity_lock while state_lock is held. The entity thread
+        # snapshots entity state first and publishes it under state_lock.
+        if emitted:
+            with entity_lock:
+                entity.consume_events(emitted)
+
         time.sleep(interval)
+
+
+def entity_thread_main():
+    """Slow advisory cognition loop.
+
+    This thread may observe and recommend. It has no path to ControlHub,
+    safety arbitration, or the drive layer.
+    """
+
+    interval = 1.0 / ENTITY_HZ
+    last_tick = time.monotonic()
+
+    while not _stop_threads.is_set():
+        started = time.monotonic()
+        dt_s = started - last_tick
+        last_tick = started
+
+        with state_lock:
+            target_visible = state.observation.visual_target_visible
+            target_size = state.observation.visual_target_size
+            safety_clear = state.safety.clear
+            mode = state.mode
+
+        with entity_lock:
+            entity.tick(dt_s)
+            entity.choose_behavior(
+                target_visible=target_visible,
+                target_size=target_size,
+                safety_clear=safety_clear,
+                mode=mode,
+            )
+            snapshot = entity.snapshot()
+
+        drives = snapshot["drives"]
+        decision = snapshot["decision"]
+
+        with state_lock:
+            state.entity.curiosity = drives["curiosity"]
+            state.entity.caution = drives["caution"]
+            state.entity.social_interest = drives["social_interest"]
+            state.entity.confidence = drives["confidence"]
+            state.entity.energy = drives["energy"]
+            state.entity.boredom = drives["boredom"]
+            state.entity.last_event_type = snapshot["last_event_type"]
+            state.entity.recommended_behavior = decision["behavior"]
+            state.entity.decision_confidence = decision["confidence"]
+            state.entity.decision_reason = decision["reason"]
+            state.entity.scores = dict(decision["scores"])
+
+        spent = time.monotonic() - started
+        time.sleep(max(0.0, interval - spent))
 
 
 _threads = []
@@ -408,6 +460,7 @@ def start_threads():
         ("control", control_thread_main),
         ("vision", vision_thread_main),
         ("events", event_thread_main),
+        ("entity", entity_thread_main),
     ):
         thread = threading.Thread(
             target=target,
@@ -526,8 +579,6 @@ def handle_mode_message(msg):
     if requested == "FOLLOW":
         with hub.lock:
             if hub.estop_latched:
-                # Arming autonomy while the e-stop is latched would let a
-                # single keypress launch the vehicle. Clear it first.
                 return
 
             hub.pressed_keys = set()
@@ -572,8 +623,6 @@ async def websocket_endpoint(ws: WebSocket):
             already_controlled = False
 
     if already_controlled:
-        # One controller at a time. Two browsers fighting over pressed_keys
-        # is how a rover ends up under the couch.
         await ws.send_text(json.dumps({
             "error": "another controller is already connected",
         }))
@@ -739,6 +788,15 @@ button.hidden {
     line-height: 1.7;
 }
 
+.entity-reason {
+    display: inline-block;
+    margin-top: 4px;
+    max-width: 320px;
+    font-size: 13px;
+    line-height: 1.35;
+    opacity: .82;
+}
+
 .good { color: #7dff9b; }
 .bad { color: #ff6464; }
 .target { color: #7ddcff; }
@@ -859,6 +917,21 @@ Count: <span id="eventCount">0</span>
 </div>
 
 <div class="group">
+<div class="group-title">ENTITY · ADVISORY</div>
+<div class="value">
+Recommend: <span id="entityBehavior">WAIT</span><br>
+Decision: <span id="entityDecisionConfidence">---</span><br>
+Curiosity: <span id="entityCuriosity">---</span><br>
+Caution: <span id="entityCaution">---</span><br>
+Social: <span id="entitySocial">---</span><br>
+Confidence: <span id="entityConfidence">---</span><br>
+Energy: <span id="entityEnergy">---</span><br>
+Boredom: <span id="entityBoredom">---</span><br>
+<span class="entity-reason">Why: <span id="entityReason">---</span></span>
+</div>
+</div>
+
+<div class="group">
 <div class="group-title">WORLD</div>
 <div class="value waiting">
 Front: <span id="front">---</span><br>
@@ -960,8 +1033,6 @@ function connect() {
         const s = JSON.parse(event.data)
 
         if (s.error) {
-            // Another tab owns control. Keep watching the camera and
-            // retry slowly in case that controller goes away.
             document.title = "Cyber Ferret (view only)"
             displayValue("safety", s.error)
             reconnectDelay = 5000
@@ -973,70 +1044,28 @@ function connect() {
 
         displayValue("mode", s.mode)
 
-        displayValue(
-            "intentSource",
-            s.intent.source
-        )
+        displayValue("intentSource", s.intent.source)
+        displayValue("intentThrottle", s.intent.throttle.toFixed(2))
+        displayValue("intentSteering", s.intent.steering.toFixed(2))
+        displayValue("intentSequence", s.intent.sequence)
 
-        displayValue(
-            "intentThrottle",
-            s.intent.throttle.toFixed(2)
-        )
+        displayValue("bodyThrottle", s.body.commanded_throttle.toFixed(2))
+        displayValue("throttleUs", s.body.throttle_us)
+        displayValue("steeringDeg", s.body.steering_deg.toFixed(1))
+        displayValue("bodySequence", s.body.sequence)
 
-        displayValue(
-            "intentSteering",
-            s.intent.steering.toFixed(2)
-        )
-
-        displayValue(
-            "intentSequence",
-            s.intent.sequence
-        )
-
-        displayValue(
-            "bodyThrottle",
-            s.body.commanded_throttle.toFixed(2)
-        )
-
-        displayValue(
-            "throttleUs",
-            s.body.throttle_us
-        )
-
-        displayValue(
-            "steeringDeg",
-            s.body.steering_deg.toFixed(1)
-        )
-
-        displayValue(
-            "bodySequence",
-            s.body.sequence
-        )
-
-        displayValue(
-            "observationSequence",
-            s.observation.sequence
-        )
-
+        displayValue("observationSequence", s.observation.sequence)
         displayValue(
             "targetVisible",
-            s.observation.visual_target_visible
-                ? "YES"
-                : "NO"
+            s.observation.visual_target_visible ? "YES" : "NO"
         )
-
-        displayValue(
-            "targetId",
-            s.observation.visual_target_id
-        )
-
+        displayValue("targetId", s.observation.visual_target_id)
         displayValue(
             "targetX",
             s.observation.visual_target_x === null
                 ? "---"
                 : s.observation.visual_target_x.toFixed(2)
         )
-
         displayValue(
             "targetSize",
             s.observation.visual_target_size === null
@@ -1044,30 +1073,25 @@ function connect() {
                 : s.observation.visual_target_size.toFixed(3)
         )
 
-        displayValue(
-            "lastEvent",
-            s.events.last_type
-        )
+        displayValue("lastEvent", s.events.last_type)
+        displayValue("eventCount", s.events.sequence)
 
+        displayValue("entityBehavior", s.entity.recommended_behavior)
         displayValue(
-            "eventCount",
-            s.events.sequence
+            "entityDecisionConfidence",
+            s.entity.decision_confidence.toFixed(2)
         )
+        displayValue("entityCuriosity", s.entity.curiosity.toFixed(2))
+        displayValue("entityCaution", s.entity.caution.toFixed(2))
+        displayValue("entitySocial", s.entity.social_interest.toFixed(2))
+        displayValue("entityConfidence", s.entity.confidence.toFixed(2))
+        displayValue("entityEnergy", s.entity.energy.toFixed(2))
+        displayValue("entityBoredom", s.entity.boredom.toFixed(2))
+        displayValue("entityReason", s.entity.decision_reason)
 
-        displayValue(
-            "loopHz",
-            s.loop_hz.toFixed(1)
-        )
-
-        displayValue(
-            "cameraFps",
-            s.camera_fps.toFixed(1)
-        )
-
-        displayValue(
-            "visionHz",
-            s.vision_hz.toFixed(1)
-        )
+        displayValue("loopHz", s.loop_hz.toFixed(1))
+        displayValue("cameraFps", s.camera_fps.toFixed(1))
+        displayValue("visionHz", s.vision_hz.toFixed(1))
 
         if (
             s.mode === "FOLLOW"

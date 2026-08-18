@@ -112,6 +112,28 @@ class EventState:
 
 
 @dataclass
+class EntityState:
+    """Observable snapshot of the slow AI entity.
+
+    Advisory only: nothing in this state directly controls actuators.
+    """
+
+    curiosity: float = 0.60
+    caution: float = 0.30
+    social_interest: float = 0.45
+    confidence: float = 0.50
+    energy: float = 1.00
+    boredom: float = 0.10
+
+    last_event_type: str | None = None
+
+    recommended_behavior: str = "WAIT"
+    decision_confidence: float = 1.0
+    decision_reason: str = "No meaningful stimulus yet."
+    scores: dict = field(default_factory=dict)
+
+
+@dataclass
 class FerretState:
     intent: ControlIntent = field(default_factory=ControlIntent)
     body: BodyState = field(default_factory=BodyState)
@@ -120,6 +142,7 @@ class FerretState:
     environment: EnvironmentState = field(default_factory=EnvironmentState)
     safety: SafetyState = field(default_factory=SafetyState)
     events: EventState = field(default_factory=EventState)
+    entity: EntityState = field(default_factory=EntityState)
     mode: str = "MANUAL"
     loop_hz: float = 0.0
     camera_fps: float = 0.0
