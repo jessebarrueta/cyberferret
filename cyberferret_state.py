@@ -60,6 +60,14 @@ class BehaviorState:
 
 @dataclass
 class EnvironmentState:
+    # Raw front/down VL53L0X measurement. This sensor is angled toward the
+    # floor, so it is not equivalent to horizontal obstacle distance.
+    tof_front_down_mm: int | None = None
+    tof_front_down_m: float | None = None
+    tof_front_down_captured_at: float | None = None
+    tof_front_down_captured_at_epoch: float | None = None
+    tof_front_down_available: bool = False
+
     front_distance_m: float | None = None
     rear_distance_m: float | None = None
     left_distance_m: float | None = None
