@@ -17,6 +17,7 @@ from cyberferret_events import EventDetector
 from cyberferret_follow import FollowController
 from cyberferret_recorder import DEFAULT_ROOT, ExperienceRecorder
 from cyberferret_state import FerretState
+from cyberferret_tof import FrontDownToF
 from cyberferret_vision import ArucoVision
 
 
@@ -29,6 +30,7 @@ THROTTLE_RAMP_PER_SEC = 0.50
 STEERING_RAMP_PER_SEC = 2.5
 
 VISION_HZ = 8
+TOF_HZ = 10
 EVENT_HZ = 20
 ENTITY_HZ = 4
 
@@ -66,6 +68,10 @@ events = EventDetector(
 
 entity = CyberFerretEntity()
 entity_lock = threading.Lock()
+
+# In simulation the sensor remains absent; state still exposes the same
+# schema so UI/recording consumers do not need a special case.
+front_down_tof = None if SIM_MODE else FrontDownToF()
 
 
 # Simulated experience is not experience. In sim mode, recording is off
@@ -375,6 +381,29 @@ def vision_thread_main():
         time.sleep(max(0.0, interval - spent))
 
 
+def tof_thread_main():
+    """Sample the front/down VL53L0X without assigning semantic meaning."""
+
+    interval = 1.0 / TOF_HZ
+
+    while not _stop_threads.is_set():
+        started = time.monotonic()
+
+        sample = front_down_tof.read()
+
+        with state_lock:
+            state.environment.tof_front_down_mm = sample["distance_mm"]
+            state.environment.tof_front_down_m = sample["distance_m"]
+            state.environment.tof_front_down_captured_at = sample["captured_at"]
+            state.environment.tof_front_down_captured_at_epoch = (
+                sample["captured_at_epoch"]
+            )
+            state.environment.tof_front_down_available = sample["available"]
+
+        spent = time.monotonic() - started
+        time.sleep(max(0.0, interval - spent))
+
+
 def event_thread_main():
     interval = 1.0 / EVENT_HZ
 
@@ -459,6 +488,7 @@ def start_threads():
     for name, target in (
         ("control", control_thread_main),
         ("vision", vision_thread_main),
+        *((("tof", tof_thread_main),) if front_down_tof is not None else ()),
         ("events", event_thread_main),
         ("entity", entity_thread_main),
     ):
@@ -486,6 +516,9 @@ async def lifespan(app: FastAPI):
 
     camera.start()
 
+    if front_down_tof is not None:
+        front_down_tof.start()
+
     if RECORD_ENABLED:
         recorder.start()
     else:
@@ -510,6 +543,8 @@ async def lifespan(app: FastAPI):
 
         drive.stop()
         recorder.stop()
+        if front_down_tof is not None:
+            front_down_tof.stop()
         camera.stop()
         drive.shutdown()
 
@@ -934,6 +969,7 @@ Boredom: <span id="entityBoredom">---</span><br>
 <div class="group">
 <div class="group-title">WORLD</div>
 <div class="value waiting">
+Front/down ToF: <span id="tofFrontDown">---</span><br>
 Front: <span id="front">---</span><br>
 Left: <span id="left">---</span><br>
 Right: <span id="right">---</span><br>
@@ -1088,6 +1124,13 @@ function connect() {
         displayValue("entityEnergy", s.entity.energy.toFixed(2))
         displayValue("entityBoredom", s.entity.boredom.toFixed(2))
         displayValue("entityReason", s.entity.decision_reason)
+
+        displayValue(
+            "tofFrontDown",
+            s.environment.tof_front_down_mm === null
+                ? "---"
+                : `${s.environment.tof_front_down_mm} mm`
+        )
 
         displayValue("loopHz", s.loop_hz.toFixed(1))
         displayValue("cameraFps", s.camera_fps.toFixed(1))
@@ -1339,3 +1382,13 @@ window.addEventListener(
 @app.get("/")
 async def index():
     return HTMLResponse(HTML)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+    )

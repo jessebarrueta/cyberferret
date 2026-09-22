@@ -5,6 +5,7 @@ opencv-contrib-python-headless
 adafruit-blinka
 adafruit-circuitpython-pca9685
 adafruit-circuitpython-motor
+adafruit-circuitpython-vl53l0x
 
 # picamera2 is installed via apt on Raspberry Pi OS (python3-picamera2).
 # Create the venv with --system-site-packages so it is visible:
